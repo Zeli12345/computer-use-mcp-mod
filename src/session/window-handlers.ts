@@ -1,6 +1,12 @@
 import type { NativeModule } from '../native.js'
 import { ok, okJson, okJsonWrappedArray, platformUnsupported, type ToolResult } from '../result.js'
 import { PROVIDER_WIDTH } from './constants.js'
+import {
+  applyLabeledGrid,
+  decodeImageBytes,
+  encodeJpeg,
+  parseGridLines,
+} from './image-grid.js'
 import type { SpawnResult } from './spawn.js'
 import type { TargetStateController } from './target-state.js'
 
@@ -46,6 +52,39 @@ export function appleScriptQuoted(value: string): string {
     .replace(/\r/g, '\\r')
     .replace(/\n/g, '\\n')
   return `"${escaped}"`
+}
+
+/**
+ * Draw the labeled coordinate grid onto a screen capture. `contentW/H` are the
+ * pre-grid content dimensions (the grid adds a frame); labels are absolute
+ * screen pixels. Returns undefined to keep the original on any failure.
+ */
+function gridScreenshot(
+  image: { base64: string; width: number; height: number; mimeType: string },
+  displayW: number,
+  displayH: number,
+  grid: [number, number],
+): { base64: string; width: number; height: number; mimeType: string } | undefined {
+  try {
+    const decoded = decodeImageBytes(Buffer.from(image.base64, 'base64'), image.mimeType)
+    const gridded = applyLabeledGrid(decoded, {
+      cols: grid[0],
+      rows: grid[1],
+      originX: 0,
+      originY: 0,
+      spanX: displayW,
+      spanY: displayH,
+      caption: 'coords: screen px',
+    })
+    return {
+      base64: encodeJpeg(gridded, 80).toString('base64'),
+      width: gridded.width,
+      height: gridded.height,
+      mimeType: 'image/jpeg',
+    }
+  } catch {
+    return undefined
+  }
 }
 
 /** App/window/display handlers with target provenance supplied explicitly. */
@@ -229,8 +268,8 @@ export async function handleWindowTool(
       const width = typeof args.width === 'number' ? args.width : PROVIDER_WIDTH[context.defaultProvider] ?? 1024
       const screenshot = native.takeScreenshot(width, undefined, 80, undefined, undefined)
       if (screenshot.base64) {
-        const annotate = args.use_annotation && Array.isArray(windows)
-        const grid = Array.isArray(args.grid_lines) ? args.grid_lines as [number, number] : undefined
+        const annotate = args.use_vision === true && args.use_annotation && Array.isArray(windows)
+        const grid = parseGridLines(args.grid_lines)
         if (annotate || grid) {
           const annotations = annotate ? windows.filter(window => window.bounds).map(window => ({
             x: Math.round(window.bounds.x * screenshot.width / display.width),
@@ -238,12 +277,24 @@ export async function handleWindowTool(
             width: Math.round(window.bounds.width * screenshot.width / display.width),
             height: Math.round(window.bounds.height * screenshot.height / display.height),
           })) : null
+          // Boxes stay native; the grid is the labeled TS overlay (absolute
+          // screen-pixel numbers) instead of the native plain lines.
           const image = native.annotateImage(
             screenshot.base64, annotations ? JSON.stringify(annotations) : null,
-            grid?.[0] ?? null, grid?.[1] ?? null, 80,
+            null, null, 80,
           )
-          content.push({ type: 'image', data: image.base64, mimeType: image.mimeType })
-          content.push({ type: 'text', text: `${image.width}x${image.height}` })
+          let payload = { base64: image.base64 as string, width: image.width as number, height: image.height as number, mimeType: image.mimeType as string }
+          let mapping = `${payload.width}x${payload.height}`
+          if (grid) {
+            const gridded = gridScreenshot(payload, display.width, display.height, grid)
+            if (gridded) {
+              payload = gridded
+              const scale = display.width / screenshot.width
+              mapping = `${payload.width}x${payload.height} | grid labels are absolute screen pixels — read a number and use it directly (content scale: screen_x = image_x * ${scale.toFixed(4)} before the frame)`
+            }
+          }
+          content.push({ type: 'image', data: payload.base64, mimeType: payload.mimeType })
+          content.push({ type: 'text', text: mapping })
         } else {
           content.push({ type: 'image', data: screenshot.base64, mimeType: screenshot.mimeType })
           content.push({ type: 'text', text: `${screenshot.width}x${screenshot.height}` })

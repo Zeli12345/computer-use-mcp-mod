@@ -85,14 +85,19 @@ export class InputHandler {
     const focus = async (resolved: { bundleId?: string; windowId?: number }) => {
       await this.#focus.ensure(resolved, this.#focus.strategyFor(tool, args))
     }
+    const humanize = args.humanize === true
+    const moveTo = async (x: number, y: number, settleMs: number): Promise<void> => {
+      if (humanize) await this.#humanMoveTo(x, y)
+      else this.#native.mouseMove(x, y)
+      await this.#sleep(settleMs)
+    }
 
     const click = async (button: string, count: number): Promise<ToolResult> => {
       const resolved = target()
       await focus(resolved)
       const [x, y] = coordinate()
       this.#validateCoordinates(x, y)
-      this.#native.mouseMove(x, y)
-      await this.#sleep(50)
+      await moveTo(x, y, humanize ? 60 : 50)
       this.#native.mouseClick(x, y, button, count)
       this.#targets.trackClick(resolved)
       return ok(`Clicked (${x}, ${y})`)
@@ -109,7 +114,8 @@ export class InputHandler {
       await focus(resolved)
       const [x, y] = coordinate()
       this.#validateCoordinates(x, y)
-      this.#native.mouseMove(x, y)
+      if (humanize) await this.#humanMoveTo(x, y)
+      else this.#native.mouseMove(x, y)
       if (resolved.bundleId) this.#targets.update(resolved, 'pointer')
       return ok(`Moved to (${x}, ${y})`)
     }
@@ -121,15 +127,15 @@ export class InputHandler {
       const from = args.start_coordinate ? coordinate('start_coordinate') : to
       const path = Array.isArray(args.path) ? args.path as [number, number][] : [from, to]
       for (const [x, y] of path) this.#validateCoordinates(x, y)
-      this.#native.mouseMove(from[0], from[1])
-      await this.#sleep(50)
+      await moveTo(from[0], from[1], humanize ? 60 : 50)
       signal?.throwIfAborted()
       this.#native.mouseButton('press', from[0], from[1])
       try {
         for (const [x, y] of path.slice(1)) {
           signal?.throwIfAborted()
           this.#native.mouseDrag(x, y)
-          await this.#sleep(16)
+          if (humanize) await this.#sleep(10 + Math.random() * 18)
+          else await this.#sleep(16)
         }
       } finally { this.#native.mouseButton('release', to[0], to[1]) }
       this.#targets.trackClick(resolved)
@@ -140,6 +146,12 @@ export class InputHandler {
       const resolved = target()
       await focus(resolved)
       const [x, y] = coordinate()
+      if (tool === 'left_mouse_down') {
+        // Every press starts with a move so hover states fire and the press
+        // lands where the pointer visibly is. Release stays put so an earlier
+        // down elsewhere can complete a drag.
+        await moveTo(x, y, humanize ? 60 : 50)
+      }
       this.#native.mouseButton(tool === 'left_mouse_down' ? 'press' : 'release', x, y)
       if (resolved.bundleId) this.#targets.update(resolved, 'pointer')
       return ok(tool === 'left_mouse_down' ? 'Mouse down' : 'Mouse up')
@@ -156,8 +168,7 @@ export class InputHandler {
       const [x, y] = coordinate()
       const direction = string('direction')
       const amount = number('amount', 3)
-      this.#native.mouseMove(x, y)
-      await this.#sleep(15)
+      await moveTo(x, y, humanize ? 40 : 15)
       const deltaX = typeof args.delta_x === 'number' ? args.delta_x : direction === 'left' ? -amount : direction === 'right' ? amount : 0
       const deltaY = typeof args.delta_y === 'number' ? args.delta_y : direction === 'up' ? -amount : direction === 'down' ? amount : 0
       this.#native.mouseScroll(deltaY, deltaX)
@@ -181,6 +192,7 @@ export class InputHandler {
         await this.#sleep(30)
       }
       if (text.length > 100 || text.includes('\n')) await this.#pasteText(text)
+      else if (humanize) await this.#humanTypeText(text)
       else this.#native.typeText(text)
       if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
       if (args.press_enter === true || args.press_enter === 'true') {
@@ -207,7 +219,15 @@ export class InputHandler {
       }
       const resolved = target()
       await focus(resolved)
-      this.#native.keyPress(combo, args.repeat !== undefined ? number('repeat', 1) : undefined)
+      const repeat = args.repeat !== undefined ? number('repeat', 1) : 1
+      if (humanize && repeat > 1) {
+        for (let i = 0; i < repeat; i++) {
+          this.#native.keyPress(combo)
+          await this.#sleep(40 + Math.random() * 90)
+        }
+      } else {
+        this.#native.keyPress(combo, args.repeat !== undefined ? repeat : undefined)
+      }
       if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
       return ok(`Pressed ${args.text}`)
     }
@@ -259,8 +279,7 @@ export class InputHandler {
       for (const [x, y] of path) this.#validateCoordinates(x, y)
 
       const [startX, startY] = path[0]
-      this.#native.mouseMove(startX, startY)
-      await this.#sleep(15)
+      await moveTo(startX, startY, humanize ? 40 : 15)
       this.#native.mousePress(startX, startY, button, modifiers)
       try {
         // Interpolate: applications that integrate incremental motion — 3D
@@ -271,12 +290,16 @@ export class InputHandler {
           for (let step = 1; step <= steps; step++) {
             this.#checkAbort(signal, 'mouse_drag aborted mid-gesture')
             const ratio = step / steps
-            this.#native.mouseDragTo(
-              Math.round(fromX + (toX - fromX) * ratio),
-              Math.round(fromY + (toY - fromY) * ratio),
-              button, modifiers,
-            )
-            await this.#sleep(8)
+            let px = Math.round(fromX + (toX - fromX) * ratio)
+            let py = Math.round(fromY + (toY - fromY) * ratio)
+            if (humanize && step < steps) {
+              // Slight hand tremor, never on the exact endpoint.
+              px += Math.round((Math.random() - 0.5) * 3)
+              py += Math.round((Math.random() - 0.5) * 3)
+            }
+            this.#native.mouseDragTo(px, py, button, modifiers)
+            if (humanize) await this.#sleep(6 + Math.random() * 12)
+            else await this.#sleep(8)
           }
         }
       } finally {
@@ -318,12 +341,11 @@ export class InputHandler {
       }
       for (const [x, y] of locations) {
         this.#checkAbort(signal, 'multi_select aborted before the next selection')
-        this.#native.mouseMove(x, y)
-        await this.#sleep(50)
+        await moveTo(x, y, humanize ? 60 : 50)
         this.#checkAbort(signal, 'multi_select aborted before click')
         if (additive) this.#native.mouseClickAdditive!(x, y, 'left', 1)
         else this.#native.mouseClick(x, y, 'left', 1)
-        await this.#sleep(30)
+        await this.#sleep(humanize ? 30 + Math.random() * 60 : 30)
       }
       if (resolved.bundleId) this.#targets.update(resolved, 'pointer')
       return ok(`Selected ${locations.length} elements`)
@@ -341,17 +363,67 @@ export class InputHandler {
     if (edits.length === 0) return this.#noCoordinates()
     for (const [x, y, text] of edits) {
       this.#checkAbort(signal, 'multi_edit aborted before the next edit')
-      this.#native.mouseMove(x, y)
-      await this.#sleep(50)
+      await moveTo(x, y, humanize ? 60 : 50)
       this.#checkAbort(signal, 'multi_edit aborted before click')
       this.#native.mouseClick(x, y, 'left', 1)
       await this.#sleep(50)
       this.#checkAbort(signal, 'multi_edit aborted before typing')
-      this.#native.typeText(text)
+      if (humanize && text.length <= 100 && !text.includes('\n')) await this.#humanTypeText(text)
+      else this.#native.typeText(text)
       await this.#sleep(30)
     }
     if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
     return ok(`Edited ${edits.length} fields`)
+  }
+
+  /**
+   * Human-like pointer motion: quadratic Bezier from the live cursor position
+   * with a random perpendicular bow, ease-out pacing, and an exact endpoint.
+   * Straight instant jumps are the classic synthetic-input tell.
+   */
+  async #humanMoveTo(x: number, y: number): Promise<void> {
+    let fromX = x
+    let fromY = y
+    try {
+      const pos = this.#native.cursorPosition()
+      fromX = pos.x
+      fromY = pos.y
+    } catch { /* fall through: jump straight */ }
+    const dx = x - fromX
+    const dy = y - fromY
+    const dist = Math.hypot(dx, dy)
+    if (dist < 3) {
+      this.#native.mouseMove(x, y)
+      return
+    }
+    // Brief reaction delay before moving.
+    await this.#sleep(20 + Math.random() * 50)
+    const len = Math.max(1, dist)
+    const bow = (0.1 + Math.random() * 0.2) * Math.min(dist * 0.5, 140) * (Math.random() < 0.5 ? -1 : 1)
+    const cx = (fromX + x) / 2 + (-dy / len) * bow
+    const cy = (fromY + y) / 2 + (dx / len) * bow
+    const steps = Math.max(6, Math.min(40, Math.round(dist / 14)))
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      const e = 1 - Math.pow(1 - t, 2) // ease-out: fast start, gentle landing
+      const px = Math.round((1 - e) * (1 - e) * fromX + 2 * (1 - e) * e * cx + e * e * x)
+      const py = Math.round((1 - e) * (1 - e) * fromY + 2 * (1 - e) * e * cy + e * e * y)
+      this.#native.mouseMove(px, py)
+      await this.#sleep(4 + Math.random() * 10)
+    }
+    this.#native.mouseMove(x, y) // exact endpoint, never left to rounding
+  }
+
+  /**
+   * Human-like typing rhythm: per-character delivery with jittered intervals
+   * and an occasional thinking pause. Long/pasted text stays on the fast path.
+   */
+  async #humanTypeText(text: string): Promise<void> {
+    for (let i = 0; i < text.length; i++) {
+      this.#native.typeText(text[i])
+      if (Math.random() < 0.04) await this.#sleep(150 + Math.random() * 200)
+      else await this.#sleep(25 + Math.random() * 55)
+    }
   }
 
   #validateCoordinates(x: number, y: number): void {

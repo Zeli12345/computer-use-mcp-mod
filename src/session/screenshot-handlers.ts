@@ -1,6 +1,13 @@
 import type { NativeModule } from '../native.js'
 import { ok, type ToolResult, platformUnsupported } from '../result.js'
 import { PROVIDER_QUALITY, PROVIDER_WIDTH } from './constants.js'
+import {
+  applyLabeledGrid,
+  decodeImageBytes,
+  encodeJpeg,
+  isUniformImage,
+  parseGridLines,
+} from './image-grid.js'
 import type { TargetStateController } from './target-state.js'
 import type { VirtualPointerController } from './virtual-pointer.js'
 
@@ -46,6 +53,98 @@ export class ScreenshotHandler {
   lastHash(): string | undefined { return this.#lastHash }
   lastScreenshot(): CachedScreenshot | undefined {
     return this.#lastScreenshot ? structuredClone(this.#lastScreenshot) : undefined
+  }
+
+  /**
+   * Rescue a blank window capture: when the window-targeted frame decodes to a
+   * (near-)uniform image, the GDI path captured nothing (GPU-composited
+   * window). Re-capture the screen at full resolution and crop to the window
+   * bounds instead. Returns the replacement image, or undefined to keep the
+   * original (decode failed, crop unavailable, or frame has real content).
+   */
+  #rescueBlankWindowCapture(
+    image: { base64?: string; width: number; height: number; mimeType: string },
+    windowId: number,
+    quality: number,
+  ): { base64: string; width: number; height: number; mimeType: string; hash: string; unchanged: boolean } | undefined {
+    try {
+      if (!image.base64) return undefined
+      const decoded = decodeImageBytes(Buffer.from(image.base64, 'base64'), image.mimeType)
+      if (!isUniformImage(decoded)) return undefined
+      const bounds = this.#native.getWindow?.(windowId)?.bounds
+      const display = this.#native.getDisplaySize()
+      if (!bounds) return undefined
+      const x1 = Math.max(0, Math.round(bounds.x))
+      const y1 = Math.max(0, Math.round(bounds.y))
+      const x2 = Math.min(display.width, Math.round(bounds.x + bounds.width))
+      const y2 = Math.min(display.height, Math.round(bounds.y + bounds.height))
+      if (x2 - x1 <= 0 || y2 - y1 <= 0) return undefined
+      if (typeof this.#native.cropImage !== 'function') return undefined
+      // Full-resolution screen source so crop coordinates map 1:1.
+      const screen = this.#native.takeScreenshot(undefined, undefined, quality, undefined, undefined)
+      if (!screen.base64) return undefined
+      const cropped = this.#native.cropImage(screen.base64, x1, y1, x2, y2, quality)
+      if (!cropped.base64) return undefined
+      return { base64: cropped.base64, width: cropped.width, height: cropped.height, mimeType: cropped.mimeType, hash: '', unchanged: false }
+    } catch {
+      return undefined // Never break screenshots: degradation is silent by design.
+    }
+  }
+
+  /**
+   * Draw the labeled coordinate grid (matplotlib style, absolute screen-pixel
+   * labels) onto a captured image. Returns the replacement image, or undefined
+   * to keep the original when decoding/encoding fails.
+   */
+  #applyGrid(
+    image: { base64?: string; width: number; height: number; mimeType: string },
+    grid: [number, number],
+    windowId: number | undefined,
+  ): { base64: string; width: number; height: number; mimeType: string; hash: string; unchanged: boolean } | undefined {
+    try {
+      if (!image.base64) return undefined
+      const decoded = decodeImageBytes(Buffer.from(image.base64, 'base64'), image.mimeType)
+      const display = this.#native.getDisplaySize()
+      let originX = 0
+      let originY = 0
+      let spanX = display.width
+      let spanY = display.height
+      let caption = 'coords: screen px'
+      if (windowId !== undefined) {
+        const bounds = this.#native.getWindow?.(windowId)?.bounds
+        if (bounds && bounds.width > 0) {
+          originX = Math.round(bounds.x)
+          originY = Math.round(bounds.y)
+          spanX = Math.round(bounds.width)
+          spanY = Math.round((bounds.width * decoded.height) / Math.max(1, decoded.width))
+          caption = 'coords: window px ~approx'
+        }
+      } else if (decoded.width > 0) {
+        // Screen capture: content spans the whole display; labels are exact.
+        spanX = display.width
+        spanY = display.height
+      }
+      const gridded = applyLabeledGrid(decoded, {
+        cols: grid[0],
+        rows: grid[1],
+        originX,
+        originY,
+        spanX,
+        spanY,
+        caption,
+      })
+      const jpeg = encodeJpeg(gridded, 80)
+      return {
+        base64: jpeg.toString('base64'),
+        width: gridded.width,
+        height: gridded.height,
+        mimeType: 'image/jpeg',
+        hash: '',
+        unchanged: false,
+      }
+    } catch {
+      return undefined // Never break screenshots: degradation is silent by design.
+    }
   }
 
   /**
@@ -111,21 +210,44 @@ export class ScreenshotHandler {
         return ok(`Screen: ${display.width}×${display.height} | Frontmost: ${frontmost?.bundleId ?? 'unknown'} (${frontmost?.displayName ?? ''})`)
       }
       const showPointer = args.show_agent_pointer === true
-      const scope = JSON.stringify([app, windowId, width, quality, windowId !== undefined ? this.#native.getWindow?.(windowId)?.bounds : undefined])
+      const grid = parseGridLines(args.grid_lines)
+      const scope = JSON.stringify([app, windowId, width, quality, grid, windowId !== undefined ? this.#native.getWindow?.(windowId)?.bounds : undefined])
       let image = this.#native.takeScreenshot(
         width, app, quality, showPointer || scope !== this.#lastCaptureScope ? undefined : this.#lastHash, windowId,
       )
       if (!showPointer && image.unchanged && this.#lastResult) return this.#lastResult
       if (!image.base64) throw new Error('Screenshot capture missing image payload')
+      let notes: string[] = []
+      // Window captures of GPU-composited windows (browsers, games, Electron)
+      // come back blank via GDI BitBlt yet valid — a "byte 0" image. Detect the
+      // uniform frame and fall back to a screen crop of the window bounds, which
+      // always shows what is actually on screen.
+      if (windowId !== undefined && !showPointer) {
+        const fallback = this.#rescueBlankWindowCapture(image, windowId, quality)
+        if (fallback) {
+          image = fallback
+          notes.push('window capture was blank (GPU-composited window), fell back to a screen crop — mapping is approximate')
+        }
+      }
       if (showPointer) image = this.#pointer.annotateScreenshot(image)
       if (!image.base64) throw new Error('Screenshot capture missing image payload')
+      if (grid) {
+        const gridded = this.#applyGrid(image, grid, windowId)
+        if (gridded) {
+          image = gridded
+          notes.push('grid labels are absolute screen pixels — read a number and use it directly')
+        }
+      }
       this.#lastCaptureScope = scope
       this.#lastHash = image.hash
-      this.#lastScreenshot = { mimeType: image.mimeType, data: image.base64, capturedAt: this.#now(), ...(windowId !== undefined || app ? { targetArgs: { ...(windowId !== undefined ? { target_window_id: windowId } : {}), ...(app ? { target_app: app } : {}) } } : {}) }
+      const payload = image.base64
+      if (!payload) throw new Error('Screenshot capture missing image payload')
+      this.#lastScreenshot = { mimeType: image.mimeType, data: payload, capturedAt: this.#now(), ...(windowId !== undefined || app ? { targetArgs: { ...(windowId !== undefined ? { target_window_id: windowId } : {}), ...(app ? { target_app: app } : {}) } } : {}) }
+      const mapping = this.#describeCapture(image.width, image.height, windowId)
       this.#lastResult = {
         content: [
-          { type: 'image', data: image.base64, mimeType: image.mimeType },
-          { type: 'text', text: this.#describeCapture(image.width, image.height, windowId) },
+          { type: 'image', data: payload, mimeType: image.mimeType },
+          { type: 'text', text: notes.length > 0 ? `${mapping}\n${notes.join('\n')}` : mapping },
         ],
       }
       return this.#lastResult

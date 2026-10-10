@@ -15,6 +15,8 @@ export const approvalTokenParam = z.string().optional().describe('Policy approva
 const numArray = (len: number) => z.array(z.number()).length(len)
 const intArray = (len: number) => z.array(z.number().int()).length(len)
 const coord = { coordinate: numArray(2).describe('[x, y] logical pixels') }
+const humanizeParam = z.boolean().optional()
+  .describe('Human-like motion: curved pointer path with variable speed (and natural typing rhythm for text). Slightly slower, much harder to fingerprint as synthetic.')
 const withTargeting = (schema: Record<string, ZodTypeAny>) => ({
   ...schema,
   target_app: targetAppParam,
@@ -82,7 +84,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     quality: z.number().int().min(0).max(100).optional().describe('Screenshot quality; 0 = PNG'),
   }, DYNAMIC_MUT)
 
-  tool('screenshot', 'Capture the screen or a specific window. BEFORE using this, consider get_ui_tree or find_element to discover UI by role/label — structured queries are cheaper than visual parsing. Auto-targets the active session window when no explicit target is given.', {
+  tool('screenshot', 'Capture the screen or a specific window. BEFORE using this, consider get_ui_tree or find_element to discover UI by role/label — structured queries are cheaper than visual parsing. Auto-targets the active session window when no explicit target is given. Window captures of GPU-composited apps fall back to a screen crop automatically when they come back blank.', {
     width: z.number().int().positive().optional()
       .describe('Override width in pixels. Omit to use provider-optimal default.'),
     quality: z.number().int().min(0).max(100).optional()
@@ -90,6 +92,8 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     target_app: z.string().optional()
       .describe('Bundle ID of app to capture (window only). Omit for full screen.'),
     target_window_id: targetWindowIdParam,
+    grid_lines: intArray(2).optional()
+      .describe('[columns, rows] labeled coordinate grid (absolute screen-pixel numbers + axis captions) drawn on the image — read a number and click it directly.'),
     provider: z.enum(PROVIDERS).optional()
       .describe('AI provider — sets optimal default width. anthropic=1024px, openai=1024px, gemini=768px, deepseek-flash=1280px, qwen/deepseek-vl/phi=896px. Default: auto (1024px).'),
     show_agent_pointer: z.boolean().optional()
@@ -102,19 +106,20 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
       .describe('Image quality. 0 = PNG (lossless, best for text). 1-100 = JPEG. Default: 0 (PNG).'),
   }, NONE_READ)
   // Pointer / keyboard — last resort; prefer click_element / press_button / set_value when possible.
-  tool('left_click', 'Left-click at coordinates (last resort — prefer click_element or press_button when the control is accessible). Requires target frontmost.', withTargeting(coord), CG_MUT)
-  tool('right_click', 'Right-click at coordinates (last resort — prefer accessibility when available). Requires target frontmost.', withTargeting(coord), CG_MUT)
-  tool('middle_click', 'Middle-click at coordinates (last resort). Requires target frontmost.', withTargeting(coord), CG_MUT)
-  tool('double_click', 'Double-click at coordinates (last resort). Requires target frontmost.', withTargeting(coord), CG_MUT)
-  tool('triple_click', 'Triple-click at coordinates (last resort). Requires target frontmost.', withTargeting(coord), CG_MUT)
-  tool('mouse_move', 'Move OS cursor to coordinates (last resort — prefer agent_pointer for non-interrupting pointer). Requires target frontmost for subsequent clicks.', withTargeting(coord), CG_MUT)
-  tool('left_click_drag', 'Click and drag', withTargeting({
+  const withHumanize = (schema: Record<string, ZodTypeAny>) => ({ ...schema, humanize: humanizeParam })
+  tool('left_click', 'Left-click at coordinates (last resort — prefer click_element or press_button when the control is accessible). Moves to the point first (fires hover), then clicks. Requires target frontmost.', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('right_click', 'Right-click at coordinates (last resort — prefer accessibility when available). Moves to the point first (fires hover), then clicks. Requires target frontmost.', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('middle_click', 'Middle-click at coordinates (last resort). Moves to the point first (fires hover), then clicks. Requires target frontmost.', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('double_click', 'Double-click at coordinates (last resort). Moves to the point first (fires hover), then clicks. Requires target frontmost.', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('triple_click', 'Triple-click at coordinates (last resort). Moves to the point first (fires hover), then clicks. Requires target frontmost.', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('mouse_move', 'Move OS cursor to coordinates (last resort — prefer agent_pointer for non-interrupting pointer). Requires target frontmost for subsequent clicks.', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('left_click_drag', 'Click and drag', withHumanize(withTargeting({
     coordinate: numArray(2),
     start_coordinate: numArray(2).optional(),
-  }), CG_MUT)
+  })), CG_MUT)
   tool('mouse_drag',
     'Drag with a chosen button while holding modifiers, through a path of waypoints. Needed by applications that draw their own UI and have no accessible controls: middle-button drag orbits a 3D viewport, shift+middle pans, ctrl+middle zooms. Motion is interpolated so applications that track incremental movement respond correctly.',
-    withTargeting({
+    withHumanize(withTargeting({
       path: z.array(numArray(2)).min(2).max(64)
         .describe('Waypoints in logical pixels, starting at the press point and ending at the release point'),
       button: z.enum(['left', 'middle', 'right']).optional().default('left')
@@ -123,12 +128,13 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
         .describe('Modifier keys held for the whole gesture'),
       steps: z.number().int().min(1).max(64).optional().default(8)
         .describe('Interpolated motion events between consecutive waypoints'),
-    }), CG_MUT)
+    })), CG_MUT)
   tool('cursor_position', 'Get current cursor position', {}, NONE_READ)
-  tool('left_mouse_down', 'Press left mouse button', withTargeting(coord), CG_MUT)
-  tool('left_mouse_up', 'Release left mouse button', withTargeting(coord), CG_MUT)
+  tool('left_mouse_down', 'Press left mouse button (moves to the point first, fires hover)', withHumanize(withTargeting(coord)), CG_MUT)
+  tool('left_mouse_up', 'Release left mouse button', withHumanize(withTargeting(coord)), CG_MUT)
   tool('scroll', 'Scroll at position', {
     ...coord,
+    humanize: humanizeParam,
     direction: z.enum(['up', 'down', 'left', 'right']),
     amount: z.number().int().positive().default(3),
     target_app: targetAppParam,
@@ -139,6 +145,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     text: z.string(),
     clear: z.boolean().optional().describe('Clear existing text before typing (Ctrl+A, Delete)'),
     press_enter: z.boolean().optional().describe('Press Enter/Return after typing to submit'),
+    humanize: humanizeParam,
     caret_position: z.enum(['start', 'end', 'idle']).optional().describe('Move caret before typing: start (Home), end (End), idle (leave as-is)'),
     target_app: targetAppParam,
     target_window_id: targetWindowIdParam,
@@ -147,6 +154,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
   tool('key', 'Press a key combination (e.g. "command+c", "return"). Tab and Shift+Tab navigate between form fields; keyboard shortcuts are usually faster than coordinate-based clicks.', {
     text: z.string().describe('Key combo like "command+c" or "return"'),
     repeat: z.number().int().positive().optional(),
+    humanize: humanizeParam,
     target_app: targetAppParam,
     target_window_id: targetWindowIdParam,
     focus_strategy: focusStrategyParam,
@@ -200,10 +208,10 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     window_loc: intArray(2).optional().describe('[x, y] top-left position'),
   }, AX_MUT)
   tool('wait', 'Wait for N seconds', { duration: z.number().positive().max(300) }, NONE_READ)
-  tool('snapshot', 'Combined screenshot + UI tree + window list + desktop info in one call. Returns structured text with all desktop state. Set use_vision=true to include screenshot image. Set use_annotation=true to draw bounding boxes on UI elements. Set grid_lines=[cols,rows] to overlay reference grid.', {
+  tool('snapshot', 'Combined screenshot + UI tree + window list + desktop info in one call. Returns structured text with all desktop state. Set use_vision=true to include screenshot image. Set use_annotation=true to draw bounding boxes on UI elements. Set grid_lines=[cols,rows] for a labeled coordinate grid (absolute screen-pixel numbers + axis captions — read a number and click it directly).', {
     use_vision: z.boolean().optional().default(false).describe('Include screenshot image in response'),
     use_annotation: z.boolean().optional().default(false).describe('Draw bounding boxes on detected UI elements'),
-    grid_lines: intArray(2).optional().describe('[columns, rows] for reference grid overlay'),
+    grid_lines: intArray(2).optional().describe('[columns, rows] labeled coordinate grid overlay (2-24 each)'),
     display: z.array(z.number().int()).optional().describe('Monitor indices to capture (omit for all)'),
     width: z.number().int().positive().optional().describe('Resize screenshot width'),
     target_app: targetAppParam,
@@ -378,6 +386,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
       locs: z.array(numArray(2)).optional().describe('List of [x,y] coordinates'),
       labels: z.array(z.string()).optional().describe('List of UI element labels'),
       press_ctrl: z.boolean().optional().default(true).describe('Hold Ctrl for additive selection'),
+      humanize: humanizeParam,
       target_app: targetAppParam,
       target_window_id: targetWindowIdParam,
       focus_strategy: focusStrategyParam,
@@ -389,6 +398,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     {
       locs: z.array(z.array(z.union([z.number(), z.string()])).length(3)).optional().describe('List of [x,y,text] tuples'),
       labels: z.array(z.array(z.string()).length(2)).optional().describe('List of [label,text] tuples'),
+      humanize: humanizeParam,
       target_app: targetAppParam,
       target_window_id: targetWindowIdParam,
       focus_strategy: focusStrategyParam,

@@ -578,17 +578,35 @@ mod win {
     }
 
     fn send_key(vk: VIRTUAL_KEY, down: bool) {
-        let flags = if down {
+        // Resolve the hardware scancode so games, Raw Input clients, and
+        // exclusive-mode DirectInput titles that ignore VK-only events still
+        // register the key. MAPVK_VK_TO_VSC_EX reports the 0xE0 prefix in the
+        // high byte for extended keys (arrows, home/end cluster, RWin, ...).
+        let base_flags = if down {
             KEYBD_EVENT_FLAGS(0)
         } else {
             KEYEVENTF_KEYUP
+        };
+        let (wvk, scan, flags) = unsafe {
+            let ex = MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC_EX);
+            if ex != 0 {
+                let mut f = base_flags | KEYEVENTF_SCANCODE;
+                if (ex & 0xFF00) != 0 {
+                    f |= KEYEVENTF_EXTENDEDKEY;
+                }
+                (VIRTUAL_KEY(0), (ex & 0xFF) as u16, f)
+            } else {
+                // No scancode for this VK (should not happen for real keys):
+                // keep the previous VK-only form rather than sending nothing.
+                (vk, 0, base_flags)
+            }
         };
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
+                    wVk: wvk,
+                    wScan: scan,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
